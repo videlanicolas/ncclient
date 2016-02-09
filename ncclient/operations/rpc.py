@@ -14,12 +14,11 @@
 
 from threading import Event, Lock
 from uuid import uuid1
-import six
 
 from ncclient.xml_ import *
 from ncclient.transport import SessionListener
 
-from ncclient.operations.errors import OperationError, TimeoutExpiredError, MissingCapabilityError
+from errors import OperationError, TimeoutExpiredError, MissingCapabilityError
 
 import logging
 logger = logging.getLogger("ncclient.operations.rpc")
@@ -38,11 +37,12 @@ class RPCError(OperationError):
         qualify("error-message"): "_message"
     }
 
-    def __init__(self, raw, errs=None):
+    def __init__(self, raw, multiple=False):
+        self._multiple = multiple
         self._raw = raw
-        if errs is None:
+        if not multiple:
             # Single RPCError
-            for attr in six.itervalues(RPCError.tag_to_attr):
+            for attr in RPCError.tag_to_attr.values():
                 setattr(self, attr, None)
             for subele in raw:
                 attr = RPCError.tag_to_attr.get(subele.tag, None)
@@ -55,7 +55,7 @@ class RPCError(OperationError):
         else:
             # Multiple errors returned. Errors is a list of RPCError objs
             errlist = []
-            for err in errs:
+            for err in raw:
                 if err.severity:
                     errsev = err.severity
                 else:
@@ -69,14 +69,13 @@ class RPCError(OperationError):
             # We are interested in the severity and the message
             self._severity = 'warning'
             self._message = "\n".join(["%s: %s" %(err['severity'].strip(), err['message'].strip()) for err in errlist])
-            self.errors = errs
             has_error = filter(lambda higherr: higherr['severity'] == 'error', errlist)
             if has_error:
                 self._severity = 'error'
             OperationError.__init__(self, self.message)
 
     def to_dict(self):
-        return dict([ (attr[1:], getattr(self, attr)) for attr in six.itervalues(RPCError.tag_to_attr) ])
+        return dict([ (attr[1:], getattr(self, attr)) for attr in RPCError.tag_to_attr.values() ])
 
     @property
     def xml(self):
@@ -213,10 +212,12 @@ class RPCReplyListener(SessionListener): # internal use
                 id = attrs[key] # get the msgid
                 with self._lock:
                     try:
+			print str(self._id2rpc[id])
                         rpc = self._id2rpc[id] # the corresponding rpc
                         logger.debug("Delivering to %r" % rpc)
                         rpc.deliver_reply(raw)
                     except KeyError:
+			print str(attrs)
                         raise OperationError("Unknown 'message-id': %s", id)
                     # no catching other exceptions, fail loudly if must
                     else:
@@ -228,7 +229,7 @@ class RPCReplyListener(SessionListener): # internal use
 
     def errback(self, err):
         try:
-            for rpc in six.itervalues(self._id2rpc):
+            for rpc in self._id2rpc.values():
                 rpc.deliver_error(err)
         finally:
             self._id2rpc.clear()
@@ -285,7 +286,8 @@ class RPC(object):
         self._async = async
         self._timeout = timeout
         self._raise_mode = raise_mode
-        self._id = uuid1().urn # Keeps things simple instead of having a class attr with running ID that has to be locked
+        #self._id = uuid1().urn # Keeps things simple instead of having a class attr with running ID that has to be locked
+        self._id = '101'
         self._listener = RPCReplyListener(session, device_handler)
         self._listener.register(self._id, self)
         self._reply = None
@@ -315,6 +317,7 @@ class RPC(object):
         req = self._wrap(op)
         self._session.send(req)
         if self._async:
+	    print 'Async request, returning ' + repr(self)
             logger.debug('Async request, returning %r', self)
             return self
         else:
@@ -325,22 +328,30 @@ class RPC(object):
                     # Error that prevented reply delivery
                     raise self._error
                 self._reply.parse()
-                if self._reply.error is not None and not self._device_handler.is_rpc_error_exempt(self._reply.error.message):
+                if self._reply.error is not None  and  \
+                                 not self._device_handler.is_rpc_error_exempt( \
+                                                            self._reply.error.message):
                     # <rpc-error>'s [ RPCError ]
 
                     if self._raise_mode == RaiseMode.ALL or (self._raise_mode == RaiseMode.ERRORS and self._reply.error.severity == "error"):
                         errlist = []
                         errors = self._reply.errors
                         if len(errors) > 1:
-                            raise RPCError(to_ele(self._reply._raw), errs=errors)
+                            raise RPCError(errors, multiple=True)
                         else:
                             raise self._reply.error
+                return self._reply
+                """
                 if self._device_handler.transform_reply():
+                    print "Entro por otro lado"
                     return NCElement(self._reply, self._device_handler.transform_reply())
                 else:
+                    print "reply: "
+                    print self._reply
                     return self._reply
+                """
             else:
-                raise TimeoutExpiredError('ncclient timed out while waiting for an rpc reply.')
+                raise TimeoutExpiredError
 
     def request(self):
         """Subclasses must implement this method. Typically only the request needs to be built as an
